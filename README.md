@@ -109,6 +109,32 @@ Open:
 http://localhost:8000
 ```
 
+## Deploy On Render
+
+Best deployment target for this project: `Render`
+
+Reason:
+- FastAPI backend + static frontend are served together
+- Python ML stack fits Render better than Netlify or Vercel
+- This repo includes a `render.yaml` blueprint for direct deployment
+
+This repo is configured so Render will:
+1. install dependencies
+2. train the `realistic_v2` models during build
+3. start the FastAPI app
+
+Files used for deployment:
+- `render.yaml`
+- `runtime.txt`
+- `requirements.txt`
+
+After connecting the GitHub repo in Render, the service should use:
+
+```text
+Build Command: pip install -r requirements.txt && python scripts/train_realistic_v2.py
+Start Command: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+```
+
 ## API
 
 - `GET /api/health`

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ai-crop-project
+    runtime: python
+    autoDeploy: true
+    healthCheckPath: /api/health
+    buildCommand: pip install -r requirements.txt && python scripts/train_realistic_v2.py
+    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
