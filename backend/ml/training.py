@@ -11,7 +11,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score, top_k_accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
@@ -75,6 +75,24 @@ def _to_float32_array(matrix: Any) -> np.ndarray:
 
 def _compute_shap_summary(model: Any, X_sample: np.ndarray, feature_names: list[str], report_dir: Path) -> dict[str, Any]:
     if shap is None:
+        if hasattr(model, "feature_importances_"):
+            importance = np.asarray(model.feature_importances_, dtype=float)
+            ranking = sorted(
+                (
+                    {"feature": feature_names[idx], "importance": float(score)}
+                    for idx, score in enumerate(importance)
+                ),
+                key=lambda item: item["importance"],
+                reverse=True,
+            )
+            summary = {
+                "status": "fallback_feature_importance",
+                "reason": "shap_not_installed",
+                "top_features": ranking[:20],
+            }
+            with (report_dir / "shap_summary.json").open("w", encoding="utf-8") as file:
+                json.dump(summary, file, indent=2)
+            return summary
         return {"status": "skipped", "reason": "shap_not_installed"}
 
     explainer = shap.TreeExplainer(model)
@@ -107,6 +125,96 @@ def _load_real_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.
     return recommendation_df, master_df, profile_df, market_df
 
 
+def _classification_preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        transformers=[("num", SimpleImputer(strategy="median"), CLASSIFICATION_FEATURES)]
+    )
+
+
+def _regression_preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([("imputer", SimpleImputer(strategy="median"))]), REGRESSION_NUMERIC_FEATURES),
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+                    ]
+                ),
+                REGRESSION_CATEGORICAL_FEATURES,
+            ),
+        ]
+    )
+
+
+def _group_signature(df: pd.DataFrame, columns: list[str], decimals: int = 3) -> np.ndarray:
+    temp = df[columns].copy()
+    for column in columns:
+        if pd.api.types.is_numeric_dtype(temp[column]):
+            temp[column] = temp[column].round(decimals)
+        temp[column] = temp[column].astype(str)
+    return temp.agg("|".join, axis=1).to_numpy()
+
+
+def _cross_validated_classification(
+    X_raw: pd.DataFrame,
+    y: np.ndarray,
+    groups: np.ndarray,
+    num_classes: int,
+) -> tuple[dict[str, dict[str, float]], np.ndarray, np.ndarray]:
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    oof_tabnet = np.zeros((len(X_raw), num_classes), dtype=np.float32)
+    oof_lgbm = np.zeros((len(X_raw), num_classes), dtype=np.float32)
+    oof_catboost = np.zeros((len(X_raw), num_classes), dtype=np.float32)
+
+    for train_idx, valid_idx in splitter.split(X_raw, y, groups):
+        preprocessor = _classification_preprocessor()
+        X_train = _to_float32_array(preprocessor.fit_transform(X_raw.iloc[train_idx]))
+        X_valid = _to_float32_array(preprocessor.transform(X_raw.iloc[valid_idx]))
+        y_train = y[train_idx]
+        y_valid = y[valid_idx]
+
+        tabnet_model = fit_tabnet_classifier(create_tabnet_classifier(num_classes), X_train, y_train, X_valid, y_valid)
+        lgbm_model = create_lgbm_classifier(num_classes)
+        lgbm_model.fit(X_train, y_train)
+        catboost_model = create_catboost_classifier(num_classes)
+        catboost_model.fit(X_train, y_train)
+
+        oof_tabnet[valid_idx] = np.asarray(tabnet_model.predict_proba(X_valid), dtype=np.float32)
+        oof_lgbm[valid_idx] = np.asarray(lgbm_model.predict_proba(X_valid), dtype=np.float32)
+        oof_catboost[valid_idx] = np.asarray(catboost_model.predict_proba(X_valid), dtype=np.float32)
+
+    cv_metrics = {
+        "tabnet": _classification_metrics(y, np.argmax(oof_tabnet, axis=1), oof_tabnet),
+        "lightgbm": _classification_metrics(y, np.argmax(oof_lgbm, axis=1), oof_lgbm),
+        "catboost": _classification_metrics(y, np.argmax(oof_catboost, axis=1), oof_catboost),
+    }
+    return cv_metrics, oof_tabnet, oof_lgbm
+
+
+def _cross_validated_regression(
+    X_raw: pd.DataFrame,
+    y: pd.Series,
+    groups: np.ndarray,
+) -> dict[str, float]:
+    splitter = GroupKFold(n_splits=5)
+    oof_pred = np.zeros(len(X_raw), dtype=np.float64)
+
+    for train_idx, valid_idx in splitter.split(X_raw, y, groups):
+        preprocessor = _regression_preprocessor()
+        X_train = _to_float32_array(preprocessor.fit_transform(X_raw.iloc[train_idx]))
+        X_valid = _to_float32_array(preprocessor.transform(X_raw.iloc[valid_idx]))
+        y_train = y.iloc[train_idx]
+
+        model = create_yield_regressor()
+        model.fit(X_train, y_train)
+        oof_pred[valid_idx] = model.predict(X_valid)
+
+    return _regression_metrics(y.to_numpy(), oof_pred)
+
+
 def train_and_save(
     dataset_path: Path | None = None,
     model_dir: Path | None = None,
@@ -121,45 +229,42 @@ def train_and_save(
     report_dir.mkdir(parents=True, exist_ok=True)
 
     recommendation_df, master_df, profile_df, market_df = _load_real_datasets()
+    original_recommendation_rows = len(recommendation_df)
+    original_master_rows = len(master_df)
+
+    recommendation_df = recommendation_df.drop_duplicates(subset=CLASSIFICATION_FEATURES + ["crop"]).reset_index(drop=True)
+    master_df = master_df.drop_duplicates(
+        subset=REGRESSION_NUMERIC_FEATURES + REGRESSION_CATEGORICAL_FEATURES + ["yield"]
+    ).reset_index(drop=True)
 
     label_encoder = LabelEncoder()
     y_class = label_encoder.fit_transform(recommendation_df["crop"])
     X_class = recommendation_df[CLASSIFICATION_FEATURES].copy()
-
-    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-        X_class,
-        y_class,
-        test_size=0.2,
-        random_state=RANDOM_STATE,
-        stratify=y_class,
-    )
-
-    class_preprocessor = ColumnTransformer(
-        transformers=[("num", SimpleImputer(strategy="median"), CLASSIFICATION_FEATURES)]
-    )
-    class_preprocessor.fit(X_train_raw)
-    X_train = _to_float32_array(class_preprocessor.transform(X_train_raw))
-    X_test = _to_float32_array(class_preprocessor.transform(X_test_raw))
-    class_feature_names = list(class_preprocessor.get_feature_names_out())
-
-    X_base, X_meta, y_base, y_meta = train_test_split(
-        X_train,
-        y_train,
-        test_size=0.25,
-        random_state=RANDOM_STATE,
-        stratify=y_train,
-    )
+    class_groups = _group_signature(X_class, CLASSIFICATION_FEATURES)
     num_classes = len(label_encoder.classes_)
 
-    tabnet_for_meta = fit_tabnet_classifier(create_tabnet_classifier(num_classes), X_base, y_base, X_meta, y_meta)
-    lgbm_for_meta = create_lgbm_classifier(num_classes)
-    lgbm_for_meta.fit(X_base, y_base)
+    class_splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    train_idx, test_idx = next(class_splitter.split(X_class, y_class, class_groups))
+    X_train_raw = X_class.iloc[train_idx].reset_index(drop=True)
+    X_test_raw = X_class.iloc[test_idx].reset_index(drop=True)
+    y_train = y_class[train_idx]
+    y_test = y_class[test_idx]
+    class_groups_train = class_groups[train_idx]
+
+    classification_cv_metrics, oof_tabnet, oof_lgbm = _cross_validated_classification(
+        X_train_raw,
+        y_train,
+        class_groups_train,
+        num_classes,
+    )
 
     stacking_model = LogisticRegression(max_iter=2000)
-    stacking_model.fit(
-        np.hstack([tabnet_for_meta.predict_proba(X_meta), lgbm_for_meta.predict_proba(X_meta)]),
-        y_meta,
-    )
+    stacking_model.fit(np.hstack([oof_tabnet, oof_lgbm]), y_train)
+
+    class_preprocessor = _classification_preprocessor()
+    X_train = _to_float32_array(class_preprocessor.fit_transform(X_train_raw))
+    X_test = _to_float32_array(class_preprocessor.transform(X_test_raw))
+    class_feature_names = list(class_preprocessor.get_feature_names_out())
 
     tabnet_model = fit_tabnet_classifier(create_tabnet_classifier(num_classes), X_train, y_train, X_test, y_test)
     lgbm_model = create_lgbm_classifier(num_classes)
@@ -183,29 +288,22 @@ def train_and_save(
     regression_df["yield"] = regression_df["yield"].astype(float)
     X_reg = regression_df[REGRESSION_NUMERIC_FEATURES + REGRESSION_CATEGORICAL_FEATURES].copy()
     y_reg = regression_df["yield"].copy()
+    reg_groups = _group_signature(regression_df, ["crop", "state_name", "district_name", "season"], decimals=0)
 
-    X_reg_train_raw, X_reg_test_raw, y_reg_train, y_reg_test = train_test_split(
-        X_reg,
-        y_reg,
-        test_size=0.2,
-        random_state=RANDOM_STATE,
+    reg_splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
+    reg_train_idx, reg_test_idx = next(reg_splitter.split(X_reg, y_reg, reg_groups))
+    X_reg_train_raw = X_reg.iloc[reg_train_idx].reset_index(drop=True)
+    X_reg_test_raw = X_reg.iloc[reg_test_idx].reset_index(drop=True)
+    y_reg_train = y_reg.iloc[reg_train_idx].reset_index(drop=True)
+    y_reg_test = y_reg.iloc[reg_test_idx].reset_index(drop=True)
+
+    regression_cv_metrics = _cross_validated_regression(
+        X_reg_train_raw,
+        y_reg_train,
+        reg_groups[reg_train_idx],
     )
 
-    regression_preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline([("imputer", SimpleImputer(strategy="median"))]), REGRESSION_NUMERIC_FEATURES),
-            (
-                "cat",
-                Pipeline(
-                    [
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
-                        ("encoder", OneHotEncoder(handle_unknown="ignore")),
-                    ]
-                ),
-                REGRESSION_CATEGORICAL_FEATURES,
-            ),
-        ]
-    )
+    regression_preprocessor = _regression_preprocessor()
     regression_preprocessor.fit(X_reg_train_raw)
     X_reg_train = _to_float32_array(regression_preprocessor.transform(X_reg_train_raw))
     X_reg_test = _to_float32_array(regression_preprocessor.transform(X_reg_test_raw))
@@ -213,7 +311,7 @@ def train_and_save(
     yield_model = create_yield_regressor()
     yield_model.fit(X_reg_train, y_reg_train)
     yield_pred = yield_model.predict(X_reg_test)
-    regression_metrics = _regression_metrics(y_reg_test, yield_pred)
+    regression_metrics = _regression_metrics(y_reg_test.to_numpy(), yield_pred)
 
     shap_summary = _compute_shap_summary(
         lgbm_model,
@@ -257,6 +355,17 @@ def train_and_save(
         "recommendation_rows": int(len(recommendation_df)),
         "production_rows": int(len(master_df)),
         "crop_count": int(len(label_encoder.classes_)),
+        "deduplication": {
+            "recommendation_rows_removed": int(original_recommendation_rows - len(recommendation_df)),
+            "production_rows_removed": int(original_master_rows - len(master_df)),
+        },
+        "evaluation_protocol": {
+            "classification_holdout": "StratifiedGroupKFold split grouped by rounded classification feature signature",
+            "classification_stacking": "Out-of-fold stacking on grouped training folds",
+            "classification_cross_validation": "5-fold StratifiedGroupKFold on training partition",
+            "regression_holdout": "GroupShuffleSplit grouped by crop+state+district+season",
+            "regression_cross_validation": "5-fold GroupKFold on grouped training partition",
+        },
         "season_options": sorted(master_df["season"].dropna().astype(str).unique().tolist()),
         "state_options": sorted(master_df["state_name"].dropna().astype(str).unique().tolist()),
         "district_options": sorted(master_df["district_name"].dropna().astype(str).unique().tolist()),
@@ -289,10 +398,12 @@ def train_and_save(
     }
 
     training_report = {
-        "data_mode": "real_13_crop_split_pipeline",
+        "data_mode": "real_13_crop_grouped_holdout_pipeline",
         "dataset_summary": dataset_summary,
         "classification_metrics": classification_metrics,
+        "classification_cv_metrics": classification_cv_metrics,
         "regression_metrics": regression_metrics,
+        "regression_cv_metrics": regression_cv_metrics,
         "comparison": {
             "lightgbm_vs_catboost": {
                 "accuracy_gap": round(classification_metrics["lightgbm"]["accuracy"] - classification_metrics["catboost"]["accuracy"], 6),
@@ -341,3 +452,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+from backend.ml.training_strict import main as strict_main
+from backend.ml.training_strict import train_and_save as strict_train_and_save
+
+train_and_save = strict_train_and_save
+main = strict_main

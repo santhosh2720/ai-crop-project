@@ -13,6 +13,7 @@ class PredictionInput(BaseModel):
     temperature_c: Optional[float] = None
     humidity: Optional[float] = Field(default=None, ge=0)
     rainfall_mm: Optional[float] = Field(default=None, ge=0)
+    moisture: Optional[float] = Field(default=None, ge=0)
     area: Optional[float] = Field(default=None, gt=0)
     price_per_ton: Optional[float] = Field(default=None, ge=0)
     season: Optional[str] = None

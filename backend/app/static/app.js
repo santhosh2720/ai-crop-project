@@ -129,8 +129,9 @@ function renderResults(result) {
   bestCropEl.innerHTML = `
     <h3>Best Crop: ${best.crop}</h3>
     <p>
-      Probability ${best.classification_probability.toFixed(4)} with yield
-      ${best.predicted_yield.toFixed(2)}, profit ${best.profit.toFixed(2)},
+      Sow in ${best.sowing_month}, expect harvest in ${best.harvest_month},
+      with a conservative yield of ${best.expected_yield_t_ha.toFixed(2)} t/ha,
+      estimated profit of ${best.profit.toFixed(2)} for your full land,
       and final score ${best.final_score.toFixed(4)}.
     </p>
   `;
@@ -140,9 +141,15 @@ function renderResults(result) {
     const row = document.createElement("tr");
     row.innerHTML = `
       <td>${item.crop}</td>
-      <td>${item.classification_probability.toFixed(4)}</td>
-      <td>${item.predicted_yield.toFixed(2)}</td>
-      <td>${item.profit.toFixed(2)}</td>
+      <td>${item.sowing_month}</td>
+      <td>${item.harvest_month}</td>
+      <td>${item.duration_months}</td>
+      <td>${item.yield_start_month}</td>
+      <td>${item.expected_yield_t_ha.toFixed(2)}</td>
+      <td>${item.adjusted_price_rs_per_kg.toFixed(2)}</td>
+      <td>${item.total_cost_rs_per_ha.toFixed(2)}</td>
+      <td>${item.revenue_rs_per_ha.toFixed(2)}</td>
+      <td>${item.profit_rs_per_ha.toFixed(2)}</td>
       <td>${item.risk.toFixed(4)}</td>
       <td>${item.sustainability_score.toFixed(4)}</td>
       <td>${item.final_score.toFixed(4)}</td>
@@ -292,7 +299,7 @@ async function syncLocationAndWeather(lat, lng) {
   await fetchWeather(lat, lng).catch(() => {
     setStatus("Weather fetch failed. You can still type values manually.");
   });
-  setStatus("Land location synced. Draw the farm boundary, then run optimization.");
+  setStatus("Land location synced. Draw the farm boundary, then predict the best crop.");
 }
 
 function clearActiveShape() {
@@ -456,7 +463,7 @@ async function loadMetadata() {
   renderForm();
   renderMetrics(metadata.training_report);
   setStatus(
-    `Loaded ${metadata.crop_count} real crops with ${metadata.recommendation_rows} agronomy rows and ${metadata.production_rows} production rows.`
+    `Loaded ${metadata.crop_count} crops with realistic season, cost, yield, and profit logic.`
   );
 }
 
@@ -467,7 +474,7 @@ form.addEventListener("submit", async (event) => {
       throw new Error("Draw your land boundary on the map first so area can be calculated.");
     }
 
-    setStatus("Running crop prediction on the selected land...");
+    setStatus("Running seasonal crop recommendation for the selected land...");
     const response = await fetch("/api/predict", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

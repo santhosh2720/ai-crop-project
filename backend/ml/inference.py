@@ -25,7 +25,7 @@ class ModelBundle:
     classification_preprocessor: Any
     regression_preprocessor: Any
     label_encoder: Any
-    tabnet_model: Any
+    tabnet_model: Any | None
     lgbm_model: Any
     catboost_model: Any
     yield_model: Any
@@ -50,6 +50,37 @@ def _candidate_scores(values: list[float]) -> list[float]:
     return [(value - low) / (high - low) for value in values]
 
 
+def _crop_economics(crop_name: str) -> dict[str, float]:
+    crop_key = crop_name.strip().lower()
+    orchard_crops = {"apple", "banana", "coconut", "coffee", "grapes", "mango", "orange", "papaya"}
+    spacious_field_crops = {"jute", "maize", "rice"}
+    pulse_crops = {"blackgram", "lentil"}
+
+    if crop_key in orchard_crops:
+        return {
+            "cultivated_area_ratio": 0.72,
+            "marketable_yield_ratio": 0.86,
+            "profit_margin_ratio": 0.36,
+        }
+    if crop_key in spacious_field_crops:
+        return {
+            "cultivated_area_ratio": 0.84,
+            "marketable_yield_ratio": 0.91,
+            "profit_margin_ratio": 0.34,
+        }
+    if crop_key in pulse_crops:
+        return {
+            "cultivated_area_ratio": 0.82,
+            "marketable_yield_ratio": 0.9,
+            "profit_margin_ratio": 0.38,
+        }
+    return {
+        "cultivated_area_ratio": 0.8,
+        "marketable_yield_ratio": 0.89,
+        "profit_margin_ratio": 0.35,
+    }
+
+
 def _to_float32_array(matrix: Any) -> np.ndarray:
     if hasattr(matrix, "toarray"):
         matrix = matrix.toarray()
@@ -59,13 +90,22 @@ def _to_float32_array(matrix: Any) -> np.ndarray:
 def load_model_bundle(model_dir: Path | None = None) -> ModelBundle:
     model_dir = Path(model_dir or MODEL_DIR)
     metadata = json.loads((model_dir / "runtime_metadata.json").read_text(encoding="utf-8"))
-    tabnet_meta = metadata["training_report"]["artifacts"]["tabnet_model"]
+    artifacts = metadata.get("training_report", {}).get("artifacts", {})
+
+    tabnet_model = None
+    tabnet_meta = artifacts.get("tabnet_model")
+    if tabnet_meta:
+        tabnet_model = load_tabnet_model(model_dir / "tabnet_model", tabnet_meta["format"])
+    elif (model_dir / "tabnet_model.joblib").exists():
+        tabnet_model = load_tabnet_model(model_dir / "tabnet_model", "joblib")
+    elif (model_dir / "tabnet_model.zip").exists():
+        tabnet_model = load_tabnet_model(model_dir / "tabnet_model", "tabnet_zip")
 
     return ModelBundle(
         classification_preprocessor=joblib.load(model_dir / "classification_preprocessor.joblib"),
         regression_preprocessor=joblib.load(model_dir / "regression_preprocessor.joblib"),
         label_encoder=joblib.load(model_dir / "crop_label_encoder.joblib"),
-        tabnet_model=load_tabnet_model(model_dir / "tabnet_model", tabnet_meta["format"]),
+        tabnet_model=tabnet_model,
         lgbm_model=joblib.load(model_dir / "lgbm_model.joblib"),
         catboost_model=joblib.load(model_dir / "catboost_model.joblib"),
         yield_model=joblib.load(model_dir / "yield_model.joblib"),
@@ -97,11 +137,22 @@ class InferenceEngine:
 
         X_class = _to_float32_array(self.bundle.classification_preprocessor.transform(class_frame))
 
-        tabnet_probs = self.bundle.tabnet_model.predict_proba(X_class)
+        tabnet_probs = None
+        if self.bundle.tabnet_model is not None:
+            tabnet_probs = np.asarray(self.bundle.tabnet_model.predict_proba(X_class))
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="X does not have valid feature names")
-            lgbm_probs = self.bundle.lgbm_model.predict_proba(X_class)
-        stacked_probs = self.bundle.stacking_model.predict_proba(np.hstack([tabnet_probs, lgbm_probs]))[0]
+            lgbm_probs = np.asarray(self.bundle.lgbm_model.predict_proba(X_class))
+
+        data_mode = self.bundle.metadata.get("training_report", {}).get("data_mode")
+        if data_mode == "strict_leakage_safe_pipeline":
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="X does not have valid feature names")
+                stacked_probs = np.asarray(self.bundle.stacking_model.predict_proba(X_class))[0]
+        else:
+            if tabnet_probs is None:
+                raise RuntimeError("TabNet model is required for legacy inference artifacts but was not found.")
+            stacked_probs = np.asarray(self.bundle.stacking_model.predict_proba(np.hstack([tabnet_probs, lgbm_probs])))[0]
 
         labels = self.bundle.label_encoder.inverse_transform(np.arange(len(stacked_probs)))
         ranked_indices = np.argsort(stacked_probs)[::-1][: self.bundle.metadata["ranking_pool_size"]]
@@ -155,7 +206,11 @@ class InferenceEngine:
                 predicted_yield = float(self.bundle.yield_model.predict(X_reg)[0])
 
             price_per_ton = float(yield_payload["price_per_ton"] or 0.0)
-            profit = predicted_yield * area * price_per_ton
+            economics = _crop_economics(crop_name)
+            effective_area = area * economics["cultivated_area_ratio"]
+            marketable_yield = max(predicted_yield, 0.0) * effective_area * economics["marketable_yield_ratio"]
+            gross_revenue = marketable_yield * price_per_ton
+            profit = gross_revenue * economics["profit_margin_ratio"]
 
             ideal_temp_value = profile.get("ideal_temperature_c")
             ideal_rain_value = profile.get("ideal_rainfall_mm")
@@ -192,10 +247,16 @@ class InferenceEngine:
                 {
                     "crop": crop_name,
                     "classification_probability": float(stacked_probs[idx]),
-                    "tabnet_probability": float(tabnet_probs[0][idx]),
+                    "tabnet_probability": None if tabnet_probs is None else float(tabnet_probs[0][idx]),
                     "lightgbm_probability": float(lgbm_probs[0][idx]),
                     "predicted_yield": float(predicted_yield),
                     "profit": float(profit),
+                    "effective_cultivated_area_ha": float(effective_area),
+                    "marketable_yield_tons": float(marketable_yield),
+                    "gross_revenue": float(gross_revenue),
+                    "cultivated_area_ratio": float(economics["cultivated_area_ratio"]),
+                    "marketable_yield_ratio": float(economics["marketable_yield_ratio"]),
+                    "profit_margin_ratio": float(economics["profit_margin_ratio"]),
                     "risk": float(normalized_risk),
                     "risk_score": float(1.0 - normalized_risk),
                     "sustainability_score": sustainability,

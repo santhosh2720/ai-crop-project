@@ -9,5 +9,9 @@ catboost_info/
 models/*.joblib
 models/*.zip
 models/*.cbm
+models/**/*.joblib
+models/**/*.zip
+models/**/*.cbm
 reports/*.json
 *.log
+temp_*.py
