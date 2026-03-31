@@ -120,19 +120,21 @@ Reason:
 
 This repo is configured so Render will:
 1. install dependencies
-2. train the `realistic_v2` models during build
-3. start the FastAPI app
+2. install Linux dependency `libgomp1` through Docker
+3. train the `realistic_v2` models during Docker build
+4. start the FastAPI app
 
 Files used for deployment:
 - `render.yaml`
 - `runtime.txt`
 - `requirements.txt`
+- `Dockerfile`
 
-After connecting the GitHub repo in Render, the service should use:
+After connecting the GitHub repo in Render, choose the Docker/Blueprint flow.
+The Docker image will build and run the project directly.
 
 ```text
-Build Command: pip install -r requirements.txt && python scripts/train_realistic_v2.py
-Start Command: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+Dockerfile: ./Dockerfile
 ```
 
 ## API

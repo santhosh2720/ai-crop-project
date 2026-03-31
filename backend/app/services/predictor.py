@@ -4,7 +4,6 @@ from functools import lru_cache
 
 from backend.ml.config_realistic_v2 import MODEL_DIR
 from backend.ml.inference_realistic_v2 import InferenceEngine
-from backend.ml.training_realistic_v2 import train_and_save
 
 
 @lru_cache(maxsize=1)
@@ -19,6 +18,8 @@ def reload_engine() -> InferenceEngine:
 
 def train_models(data_dir: str | None = None) -> dict:
     del data_dir
+    from backend.ml.training_realistic_v2 import train_and_save
+
     report = train_and_save()
     reload_engine()
     return report
